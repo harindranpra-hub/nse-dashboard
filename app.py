@@ -1,137 +1,63 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
-import datetime
+from nsepython import *
+from datetime import datetime, timedelta
 
-# ------------------------------
-# 1. NSE Ticker Normalization Fix
-# ------------------------------
+st.set_page_config(page_title="NSE Momentum Screener", layout="wide")
 
-def normalize_ticker(t):
-    t = t.strip().upper()
+st.title("📈 NSE Quantitative Momentum Dashboard (12-1 + Volatility)")
 
-    # Fix known special tickers
-    special_map = {
-        "M&M": "MM",
-        "SBI": "SBIN",
-        "SBIN": "SBIN",
-        "BRITANNIA": "BRITANNIA",
-        "HDFCBANK": "HDFCBANK",
-        "BAJFINANCE": "BAJFINANCE",
-    }
+# --------------------------------------------------------------
+# Step 1: Load NSE Stock List (NIFTY 100)
+# --------------------------------------------------------------
 
-    if t in special_map:
-        t = special_map[t]
+st.write("Loading NSE stock list...")
+all_stocks = indice_components("NIFTY 100")   # Returns list of symbols
+tickers = [s + ".NS" for s in all_stocks]
 
-    # Remove invalid characters
-    t = t.replace("&", "").replace(" ", "").replace(",", "").replace("\n", "")
+# --------------------------------------------------------------
+# Step 2: User Parameters
+# --------------------------------------------------------------
+st.sidebar.header("Settings")
+lookback_months = st.sidebar.slider("Momentum Lookback (12-1 standard uses 12)", 6, 18, 12)
+exclude_last_month = st.sidebar.checkbox("Exclude Most Recent Month (12-1 momentum)", True)
+top_n = st.sidebar.slider("Top Stocks to Show", 5, 50, 10)
 
-    # Avoid double .NS
-    if t.endswith(".NS"):
-        return t
-    else:
-        return t + ".NS"
+# --------------------------------------------------------------
+# Step 3: Fetch OHLCV from NSE API
+# --------------------------------------------------------------
 
+@st.cache_data(show_spinner=True)
+def get_price_history(symbol):
+    try:
+        df = nse_eq(symbol.replace(".NS", ""))
+        df['date'] = pd.to_datetime(df['CH_TIMESTAMP'])
+        df = df[['date', 'CH_CLOSING_PRICE']].set_index('date')
+        df = df.asfreq('D').ffill()   # forward-fill missing days
+        monthly = df.resample("M").last()
+        return monthly
+    except:
+        return None
 
-# ------------------------------
-# 2. Download Prices Safely
-# ------------------------------
+momentum_data = {}
 
-def safe_price_download(tickers):
-    valid = {}
-    for t in tickers:
-        try:
-            df = yf.download(t, period="2y", interval="1mo", progress=False)
-            if df is not None and not df.empty:
-                valid[t] = df["Adj Close"]
-        except:
-            pass
-    return valid
+st.write("Fetching price history (may take 15–20 sec)...")
 
+for sym in tickers:
+    data = get_price_history(sym)
+    if data is None or len(data) < lookback_months + 2:
+        continue
+    momentum_data[sym] = data
 
-# ------------------------------
-# 3. Momentum (12-1) + Volatility
-# ------------------------------
+# --------------------------------------------------------------
+# Step 4: Compute 12-1 Momentum
+# --------------------------------------------------------------
 
-def compute_scores(price_dict):
-    results = []
+results = []
 
-    for ticker, series in price_dict.items():
-        if len(series) < 13:
-            continue
+for sym, df in momentum_data.items():
+    if exclude_last_month:
+        base = df.iloc[:-1]   #
 
-        # 12-month return minus last month's return
-        momentum_12 = series.pct_change(12).iloc[-1]
-        last_month = series.pct_change(1).iloc[-1]
-        momentum_12_1 = momentum_12 - last_month
-
-        # Volatility (last 6 months)
-        vol = series.pct_change().iloc[-6:].std()
-
-        # Risk-adjusted score
-        score = momentum_12_1 / vol if vol != 0 else np.nan
-
-        results.append([ticker, momentum_12, momentum_12_1, vol, score])
-
-    df = pd.DataFrame(results, columns=["Ticker", "12m_Return", "12-1_Momentum", "Vol", "Score"])
-    df = df.sort_values("Score", ascending=False).reset_index(drop=True)
-
-    return df
-
-
-# ------------------------------
-# 4. STREAMLIT UI
-# ------------------------------
-
-st.title("📈 NSE Momentum Screener (12-1 + Volatility Adjusted)")
-st.write("Automatically fixes tickers like M&M → MM, SBI → SBIN, removes .NS duplicates, and ensures stable data.")
-
-tickers_input = st.text_area("Enter NSE tickers (NO .NS needed):",
-"""
-HDFCBANK, RELIANCE, ICICIBANK, BHARTIARTL, ASIANPAINT, BAJFINANCE, MARUTI,
-LT, SUNPHARMA, DRREDDY, TCS, INFY, AXISBANK, HCLTECH, WIPRO, SBIN, MM,
-TITAN, ULTRACEMCO, HINDUNILVR, ITC, JSWSTEEL, GRASIM, BAJAJFINSV, EICHERMOT,
-BRITANNIA
-""".strip())
-
-max_tickers = st.slider("Max tickers to process:", 5, 40, 20)
-
-if st.button("Run Screening"):
-
-    raw_list = tickers_input.replace("\n", " ").split()
-    raw_list = [t.replace(",", "") for t in raw_list if t.strip()]
-
-    # Normalize tickers
-    clean_tickers = []
-    for t in raw_list:
-        try:
-            nt = normalize_ticker(t)
-            clean_tickers.append(nt)
-        except:
-            pass
-
-    clean_tickers = list(dict.fromkeys(clean_tickers))  # remove duplicates
-    clean_tickers = clean_tickers[:max_tickers]
-
-    st.write("### ✔ Normalized tickers:")
-    st.write(clean_tickers)
-
-    # Download
-    st.write("Downloading price data...")
-    price_dict = safe_price_download(clean_tickers)
-
-    if len(price_dict) == 0:
-        st.error("No valid price data returned. Try fewer tickers or remove invalid ones.")
-    else:
-        st.success(f"Valid tickers received data: {list(price_dict.keys())}")
-
-        # Compute scores
-        df = compute_scores(price_dict)
-
-        st.write("### 📊 Ranking Table")
-        st.dataframe(df)
-
-        st.write("### 🏆 Top 10 Stocks")
-        st.table(df.head(10))
 
