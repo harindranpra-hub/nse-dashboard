@@ -1,3 +1,5 @@
 nsepython
-nsetools
 pandas
+numpy
+streamlit
+
