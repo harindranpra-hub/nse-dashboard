@@ -1,146 +1,137 @@
-# app.py
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import yfinance as yf
-from datetime import date, timedelta
-import time
+import datetime
 
-st.set_page_config(page_title="NSE Momentum (12-minus-1) — Risk Adj", layout="wide")
+# ------------------------------
+# 1. NSE Ticker Normalization Fix
+# ------------------------------
 
-st.title("NSE — 12-minus-1 Momentum (Volatility-Smoothed) — Proof of Concept")
-st.markdown("""
-This dashboard computes *12-minus-1* momentum for a chosen universe (monthly returns),
-computes volatility (12-month SD of monthly returns), and ranks by *smooth momentum*
-(= 12-minus-1 / volatility).  
-Data source: yfinance (NSE tickers use .NS suffix).  
-*Notes:* uses adjusted close from Yahoo Finance — reasonable for a proof of concept.
-""")
+def normalize_ticker(t):
+    t = t.strip().upper()
 
-# -------------------------
-# Controls
-# -------------------------
-col1, col2 = st.columns([2,1])
-
-with col1:
-    st.header("Universe selection")
-    st.markdown("Choose the tickers to screen. The app expects NSE tickers with NO suffix; it adds .NS automatically.")
-    sample_pool = st.text_area("Paste tickers (comma-separated) or leave blank to use recommended pool",
-                              value="HDFCBANK,RELIANCE,ICICIBANK,BHARTIARTL,ASIANPAINT,BAJFINANCE,MARUTI,LT,SUNPHARMA,DRREDDY,TCS,INFY,AXISBANK,HCLTECH,WIPRO,SBI,TECHM,TITAN,ULTRACEMCO,M_M,HINDUNILVR,ITC,JSWSTEEL,GRASIM,BAJAJFINSV,EICHERMOT,BRITANNIA",
-                              height=140)
-
-with col2:
-    st.header("Parameters")
-    rebal_freq = st.selectbox("Monthly aggregation: Use month-end series or last trading day?",
-                              ["month-end (resample 'M')","last trading day (resample 'M' last)"])
-    run_button = st.button("Run screening")
-    max_tickers = st.number_input("Max tickers to process (avoid timeouts)", min_value=10, max_value=200, value=60, step=5)
-
-# -------------------------
-# Helpers
-# -------------------------
-@st.cache_data(ttl=60*60)  # cache for 1 hour
-def fetch_monthly_adjclose(ticker, start_date, end_date):
-    # yfinance ticker uses .NS
-    yf_t = ticker + ".NS"
-    try:
-        data = yf.download(yf_t, start=start_date, end=end_date, progress=False, threads=False)
-        if data is None or data.shape[0] == 0:
-            return None
-        # Use Adj Close if available, else Close
-        if 'Adj Close' in data.columns:
-            s = data['Adj Close'].copy()
-        else:
-            s = data['Close'].copy()
-        s.index = pd.to_datetime(s.index)
-        monthly = s.resample('M').last().to_frame(name='adjclose')
-        # also fetch basic volume (average daily vol)
-        vol = data['Volume'].resample('M').mean().to_frame(name='avgvol')
-        monthly = monthly.join(vol, how='left')
-        return monthly
-    except Exception as e:
-        return None
-
-def compute_metrics(monthly_df):
-    # monthly_df must have at least 15 months
-    df = monthly_df.dropna()
-    if df.shape[0] < 15:
-        return None
-    df['mret'] = df['adjclose'].pct_change()
-    # 12-minus-1: return from index -14 to -2 (months)
-    r_12_minus_1 = df['adjclose'].iloc[-2] / df['adjclose'].iloc[-14] - 1
-    r_12_incl = df['adjclose'].iloc[-1] / df['adjclose'].iloc[-13] - 1
-    r_3m = df['adjclose'].iloc[-1] / df['adjclose'].iloc[-4] - 1
-    r_1m = df['adjclose'].pct_change().iloc[-1]
-    vol = df['mret'].iloc[-12:].std()
-    avg_vol = df['avgvol'].iloc[-6:].mean() if 'avgvol' in df.columns else np.nan
-    smooth = r_12_minus_1 / vol if (vol is not None and vol != 0 and not np.isnan(vol)) else np.nan
-    return {
-        "12_minus_1": r_12_minus_1,
-        "12_incl": r_12_incl,
-        "3m": r_3m,
-        "1m": r_1m,
-        "volatility": vol,
-        "avg_monthly_volume": avg_vol,
-        "smooth_momentum": smooth
+    # Fix known special tickers
+    special_map = {
+        "M&M": "MM",
+        "SBI": "SBIN",
+        "SBIN": "SBIN",
+        "BRITANNIA": "BRITANNIA",
+        "HDFCBANK": "HDFCBANK",
+        "BAJFINANCE": "BAJFINANCE",
     }
 
-# -------------------------
-# Main run
-# -------------------------
-if run_button:
-    tickers = [t.strip().upper().replace(".NS","").replace(" ", "") for t in sample_pool.split(",") if t.strip()!='']
-    if len(tickers) == 0:
-        st.error("No tickers provided.")
+    if t in special_map:
+        t = special_map[t]
+
+    # Remove invalid characters
+    t = t.replace("&", "").replace(" ", "").replace(",", "").replace("\n", "")
+
+    # Avoid double .NS
+    if t.endswith(".NS"):
+        return t
     else:
-        tickers = tickers[:int(max_tickers)]
-        st.info(f"Processing {len(tickers)} tickers. This may take a minute or two.")
-        progress = st.progress(0)
-        results = []
-        end = date.today()
-        start = date(end.year - 3, end.month, end.day)  # 3-year buffer
-        for idx, t in enumerate(tickers):
-            progress.progress(int((idx+1)/len(tickers)*100))
-            monthly = fetch_monthly_adjclose(t, start, end)
-            time.sleep(0.1)  # small throttle
-            if monthly is None or monthly.empty:
-                continue
-            metrics = compute_metrics(monthly)
-            if metrics is None:
-                continue
-            row = {"ticker": t}
-            row.update(metrics)
-            results.append(row)
+        return t + ".NS"
 
-        if len(results) == 0:
-            st.error("No tickers returned valid monthly data. Try fewer tickers or different pool.")
-        else:
-            df = pd.DataFrame(results)
-            df = df.dropna(subset=['smooth_momentum'])
-            df_sorted = df.sort_values(by='smooth_momentum', ascending=False).reset_index(drop=True)
-            st.success("Screen complete.")
-            st.subheader("Top 10 (Risk-Adjusted Momentum)")
-            st.dataframe(df_sorted.head(10).style.format({
-                "12_minus_1": "{:.2%}",
-                "12_incl": "{:.2%}",
-                "3m": "{:.2%}",
-                "1m": "{:.2%}",
-                "volatility": "{:.2%}",
-                "avg_monthly_volume": "{:,.0f}",
-                "smooth_momentum": "{:.3f}"
-            }), height=360)
 
-            with st.expander("Full ranked table (downloadable)"):
-                st.dataframe(df_sorted.style.format({
-                    "12_minus_1": "{:.2%}",
-                    "12_incl": "{:.2%}",
-                    "3m": "{:.2%}",
-                    "1m": "{:.2%}",
-                    "volatility": "{:.2%}",
-                    "avg_monthly_volume": "{:,.0f}",
-                    "smooth_momentum": "{:.3f}"
-                }), height=400)
-                csv = df_sorted.to_csv(index=False)
-                st.download_button("Download CSV", csv, file_name="nse_momentum_ranked.csv", mime="text/csv")
+# ------------------------------
+# 2. Download Prices Safely
+# ------------------------------
 
-            st.markdown("*Interpretation & next steps:*\n- smooth_momentum = 12-minus-1 divided by monthly vol (higher is better).\n- Use liquidity (avg_monthly_volume) to prune illiquid names.\n- Backtest before deploying capital.")
+def safe_price_download(tickers):
+    valid = {}
+    for t in tickers:
+        try:
+            df = yf.download(t, period="2y", interval="1mo", progress=False)
+            if df is not None and not df.empty:
+                valid[t] = df["Adj Close"]
+        except:
+            pass
+    return valid
+
+
+# ------------------------------
+# 3. Momentum (12-1) + Volatility
+# ------------------------------
+
+def compute_scores(price_dict):
+    results = []
+
+    for ticker, series in price_dict.items():
+        if len(series) < 13:
+            continue
+
+        # 12-month return minus last month's return
+        momentum_12 = series.pct_change(12).iloc[-1]
+        last_month = series.pct_change(1).iloc[-1]
+        momentum_12_1 = momentum_12 - last_month
+
+        # Volatility (last 6 months)
+        vol = series.pct_change().iloc[-6:].std()
+
+        # Risk-adjusted score
+        score = momentum_12_1 / vol if vol != 0 else np.nan
+
+        results.append([ticker, momentum_12, momentum_12_1, vol, score])
+
+    df = pd.DataFrame(results, columns=["Ticker", "12m_Return", "12-1_Momentum", "Vol", "Score"])
+    df = df.sort_values("Score", ascending=False).reset_index(drop=True)
+
+    return df
+
+
+# ------------------------------
+# 4. STREAMLIT UI
+# ------------------------------
+
+st.title("📈 NSE Momentum Screener (12-1 + Volatility Adjusted)")
+st.write("Automatically fixes tickers like M&M → MM, SBI → SBIN, removes .NS duplicates, and ensures stable data.")
+
+tickers_input = st.text_area("Enter NSE tickers (NO .NS needed):",
+"""
+HDFCBANK, RELIANCE, ICICIBANK, BHARTIARTL, ASIANPAINT, BAJFINANCE, MARUTI,
+LT, SUNPHARMA, DRREDDY, TCS, INFY, AXISBANK, HCLTECH, WIPRO, SBIN, MM,
+TITAN, ULTRACEMCO, HINDUNILVR, ITC, JSWSTEEL, GRASIM, BAJAJFINSV, EICHERMOT,
+BRITANNIA
+""".strip())
+
+max_tickers = st.slider("Max tickers to process:", 5, 40, 20)
+
+if st.button("Run Screening"):
+
+    raw_list = tickers_input.replace("\n", " ").split()
+    raw_list = [t.replace(",", "") for t in raw_list if t.strip()]
+
+    # Normalize tickers
+    clean_tickers = []
+    for t in raw_list:
+        try:
+            nt = normalize_ticker(t)
+            clean_tickers.append(nt)
+        except:
+            pass
+
+    clean_tickers = list(dict.fromkeys(clean_tickers))  # remove duplicates
+    clean_tickers = clean_tickers[:max_tickers]
+
+    st.write("### ✔ Normalized tickers:")
+    st.write(clean_tickers)
+
+    # Download
+    st.write("Downloading price data...")
+    price_dict = safe_price_download(clean_tickers)
+
+    if len(price_dict) == 0:
+        st.error("No valid price data returned. Try fewer tickers or remove invalid ones.")
+    else:
+        st.success(f"Valid tickers received data: {list(price_dict.keys())}")
+
+        # Compute scores
+        df = compute_scores(price_dict)
+
+        st.write("### 📊 Ranking Table")
+        st.dataframe(df)
+
+        st.write("### 🏆 Top 10 Stocks")
+        st.table(df.head(10))
+
